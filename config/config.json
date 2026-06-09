@@ -1,0 +1,19 @@
+{
+  "SMTP": {
+    "server": "",
+    "port": 587,
+    "username": "",
+    "password": "your_real_password",
+    "use_tls": true,
+    "from_addr": "",
+    "to_addr": ""
+  },
+  "SETTINGS": {
+    "ban_frequency": 5,
+    "logon_types": "2,3,7,10"
+  },
+  "MESSAGE": {
+    "subject_success": "Columba 登录通知 - 成功",
+    "body_success": "用户 {username} 在计算机 {computer} 上登录成功\n登录类型: {logon_type_desc}\n时间: {time}\n来源 IP: {source_ip}\n进程: {process_name}"
+  }
+}
