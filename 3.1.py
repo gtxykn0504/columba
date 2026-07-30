@@ -64,64 +64,15 @@ def run_as_admin():
     sys.exit(0)
 
 # ========== 配置加载 ==========
-def load_config(exit_on_error=True):
-    """加载配置文件，exit_on_error=False 时抛出异常而非退出"""
-    if not os.path.exists(CONFIG_FILE):
-        if exit_on_error:
-            show_error(f"配置文件不存在：{CONFIG_FILE}")
-            sys.exit(1)
-        else:
-            raise FileNotFoundError(f"配置文件不存在：{CONFIG_FILE}")
+def load_config():
+    with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+        cfg = json.load(f)
 
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
-            cfg = json.load(f)
-    except Exception as e:
-        if exit_on_error:
-            show_error(f"配置文件解析失败：{e}\n请检查 JSON 格式。")
-            sys.exit(1)
-        else:
-            raise
-
-    # 验证 SMTP
-    smtp = cfg.get("SMTP")
-    required_smtp = ("server", "port", "username", "password", "from_addr", "to_addr")
-    if not smtp or not all(k in smtp for k in required_smtp):
-        if exit_on_error:
-            show_error("配置文件缺少 SMTP 必要字段")
-            sys.exit(1)
-        else:
-            raise ValueError("配置文件缺少 SMTP 必要字段")
-
-    # 验证 MESSAGE
-    msg = cfg.get("MESSAGE", {})
-    if not msg.get("subject_success") or not msg.get("body_success"):
-        if exit_on_error:
-            show_error("配置文件缺少 MESSAGE.subject_success 或 body_success")
-            sys.exit(1)
-        else:
-            raise ValueError("缺少 MESSAGE.subject_success 或 body_success")
-
-    # 解析允许的登录类型
-    types_str = cfg.get("SETTINGS", {}).get("logon_types", "")
-    allowed_types = {int(t.strip()) for t in types_str.split(',') if t.strip().isdigit()}
-    if not allowed_types:
-        if exit_on_error:
-            show_error("配置 SETTINGS.logon_types 无效或为空，请填写数字并用逗号分隔")
-            sys.exit(1)
-        else:
-            raise ValueError("SETTINGS.logon_types 无效或为空")
-
-    # 解析封禁频率
-    try:
-        ban_frequency = int(cfg.get("SETTINGS", {}).get("ban_frequency", 5))
-    except (ValueError, TypeError):
-        if exit_on_error:
-            show_error("配置 SETTINGS.ban_frequency 异常")
-            sys.exit(1)
-        else:
-            raise ValueError("SETTINGS.ban_frequency 异常")
-
+    smtp = cfg["SMTP"]
+    msg = cfg["MESSAGE"]
+    settings = cfg.get("SETTINGS", {})
+    allowed_types = {int(t.strip()) for t in settings.get("logon_types", "").split(',') if t.strip().isdigit()}
+    ban_frequency = int(settings.get("ban_frequency", 5))
     return smtp, msg, allowed_types, ban_frequency
 
 def get_logon_type_desc(logon_type):
@@ -166,11 +117,7 @@ def send_mail(smtp_cfg, msg_cfg, event_data=None, test=False):
         if "logon_type" in event_data:
             event_data["logon_type_desc"] = get_logon_type_desc(int(event_data["logon_type"]))
         subject = msg_cfg["subject_success"]
-        try:
-            body = msg_cfg["body_success"].format(**event_data)
-        except KeyError as e:
-            log(f"邮件模板错误，缺少 {e}")
-            body = msg_cfg["body_success"]
+        body = msg_cfg["body_success"].format(**event_data)
     return _send_email_raw(smtp_cfg, subject, body)
 
 # ========== 安全日志监听 ==========
@@ -178,7 +125,7 @@ class LoginMonitor:
     def __init__(self, success_cb, failure_cb, allowed_types):
         self.success_cb = success_cb
         self.failure_cb = failure_cb
-        self.allowed_logon_types = allowed_types   # 可动态修改
+        self.allowed_types = allowed_types
         self.running = True
         self.processed = {}
 
@@ -201,9 +148,9 @@ class LoginMonitor:
             time_fmt = time_str + f",{event.TimeGenerated.microsecond // 1000:03d}"
             computer = os.environ.get("COMPUTERNAME", "Unknown")
 
-            if event.EventID == 4624:  # 成功
+            if event.EventID == 4624:
                 logon_type = self._parse_logon_type(strings, 8)
-                if logon_type is None or (self.allowed_logon_types and logon_type not in self.allowed_logon_types):
+                if logon_type is None or (self.allowed_types and logon_type not in self.allowed_types):
                     return None
                 return {
                     "event_type": "success", "logon_type": logon_type,
@@ -213,7 +160,7 @@ class LoginMonitor:
                     "source_ip": strings[18] if len(strings) > 18 else "?",
                     "time": time_str, "time_formatted": time_fmt, "computer": computer
                 }
-            elif event.EventID == 4625:  # 失败
+            elif event.EventID == 4625:
                 logon_type = self._parse_logon_type(strings, 10)
                 if logon_type is None:
                     return None
@@ -267,7 +214,6 @@ class LoginMonitor:
 # ========== 失败登录记录与拦截 ==========
 class FailureCollector:
     def __init__(self, smtp_cfg, msg_cfg, ban_frequency):
-        # 配置以实例变量存储，支持动态更新
         self.smtp_cfg = smtp_cfg
         self.msg_cfg = msg_cfg
         self.ban_frequency = ban_frequency
@@ -393,18 +339,9 @@ class FailureCollector:
     def shutdown(self):
         self.stop_event.set()
 
-    # ---------- 动态更新配置 ----------
-    def update_config(self, smtp_cfg, msg_cfg, ban_frequency):
-        """外部调用，更新邮件配置和封禁频率"""
-        self.smtp_cfg = smtp_cfg
-        self.msg_cfg = msg_cfg
-        self.ban_frequency = ban_frequency
-        log("FailureCollector 配置已更新")
-
 # ========== 托盘应用 ==========
 class TrayApp:
     def __init__(self):
-        # 加载配置（首次启动，失败则退出）
         self.smtp, self.msg, self.allowed_types, self.ban_freq = load_config()
         self.collector = FailureCollector(self.smtp, self.msg, self.ban_freq)
         self.monitor = None
@@ -428,53 +365,20 @@ class TrayApp:
         send_mail(self.smtp, self.msg, test=True)
 
     def edit_config(self):
-        """打开配置文件（记事本），并立即重新加载（类似2.1.py的行为）"""
         if not os.path.exists(CONFIG_FILE):
-            # 若不存在，创建一个默认模板
-            default = {
-                "SMTP": {"server": "smtp.example.com", "port": 587, "username": "", "password": "",
-                         "use_tls": True, "from_addr": "", "to_addr": ""},
-                "SETTINGS": {"ban_frequency": 5, "logon_types": "2,3,7,10"},
-                "MESSAGE": {"subject_success": "Columba 登录通知 - 成功",
-                            "body_success": "用户 {username} 在计算机 {computer} 上登录成功\n登录类型: {logon_type_desc}\n时间: {time}\n来源 IP: {source_ip}\n进程: {process_name}"}
-            }
-            try:
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                    json.dump(default, f, indent=2, ensure_ascii=False)
-                log("已创建默认配置文件模板: " + CONFIG_FILE)
-            except Exception as e:
-                log(f"写入默认模板时异常: {e}")
-                show_error(f"无法创建配置文件模板：{e}")
-                return
-        # 打开记事本编辑
+            show_error(f"配置文件不存在：{CONFIG_FILE}")
+            return
         subprocess.Popen(["notepad.exe", CONFIG_FILE], creationflags=subprocess.CREATE_NO_WINDOW)
-        # 立即重新加载配置（注意：此时用户可能还没保存，但行为与2.1.py一致）
-        self.reload_config()
 
     def reload_config(self):
-        """重新加载配置文件，并更新所有相关模块"""
-        try:
-            new_smtp, new_msg, new_allowed_types, new_ban_freq = load_config(exit_on_error=False)
-            # 更新自身属性
-            self.smtp = new_smtp
-            self.msg = new_msg
-            self.allowed_types = new_allowed_types
-            self.ban_freq = new_ban_freq
-
-            # 更新监听器的允许类型
-            if self.monitor:
-                self.monitor.allowed_logon_types = new_allowed_types
-
-            # 更新失败收集器的配置
-            self.collector.update_config(new_smtp, new_msg, new_ban_freq)
-
-            # 清空成功登录的冷却缓存（可选，避免旧配置影响）
-            self.last_success.clear()
-
-            log("配置已重新加载，新配置已生效")
-        except Exception as e:
-            log(f"重新加载配置失败: {e}")
-            show_error(f"配置文件错误，无法重新加载：{e}\n请检查文件格式。")
+        self.smtp, self.msg, self.allowed_types, self.ban_freq = load_config()
+        if self.monitor:
+            self.monitor.allowed_types = self.allowed_types
+        self.collector.smtp_cfg = self.smtp
+        self.collector.msg_cfg = self.msg
+        self.collector.ban_frequency = self.ban_freq
+        self.last_success.clear()
+        log("配置已更新")
 
     def view_log(self):
         if os.path.exists(LOG_FILE):
@@ -496,7 +400,6 @@ class TrayApp:
         self.monitor = LoginMonitor(self.send_success, self.handle_failure, self.allowed_types)
         threading.Thread(target=self.monitor.run, daemon=True).start()
 
-        # 加载图标
         try:
             image = Image.open(ICON_FILE) if os.path.exists(ICON_FILE) else Image.new('RGBA', (64, 64), (0,0,0,0))
         except Exception:
@@ -505,7 +408,8 @@ class TrayApp:
 
         menu = pystray.Menu(
             pystray.MenuItem("测试邮件", self.test_mail),
-            pystray.MenuItem("编辑配置", self.edit_config),   # 手动编辑并重载
+            pystray.MenuItem("编辑配置", self.edit_config),
+            pystray.MenuItem("重载配置", self.reload_config),
             pystray.MenuItem("查看日志", self.view_log),
             pystray.MenuItem("查看失败登录记录", self.view_failure),
             pystray.MenuItem("退出", self.on_quit)
@@ -526,7 +430,7 @@ def main():
         log(f"程序启动失败: {e}")
         import traceback
         log(traceback.format_exc())
-        show_error(f"程序启动失败：{e}")
+        show_error(f"程序启动失败：{e}。请检查日志文件获取更多信息。")
         input("按回车键退出...")
 
 if __name__ == "__main__":
